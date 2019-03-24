@@ -6,13 +6,15 @@ import numpy as np
 
 from anomaly.isolation.split_rule import NumericalSplitRule, CategoricalSplitRule
 from anomaly.isolation.node import Node
+from anomaly.isolation.metrics import anomaly_score
 from anomaly.utils import categorical_columns, numerical_columns, map_string_to_categorical
 
 
 class IsolationForest:
-    def __init__(self, number_trees: int, sample_frac: float = 0.5, replace: bool = True):
+    def __init__(self, number_trees: int, sample_frac: Optional[float] = None, sample_n: int = 256, replace: bool = True):
         self.number_trees = number_trees
         self.sample_frac = sample_frac
+        self.sample_n = sample_n
         self.replace = replace
         self.trees: Optional[List[Node]] = None
         self.max_depth: Optional[int] = None
@@ -20,14 +22,26 @@ class IsolationForest:
 
     def fit(self, data: pd.DataFrame) -> None:
         data = map_string_to_categorical(data)
-        dataset_size = len(data) * self.sample_frac
-        self.max_depth = np.round(np.log2(dataset_size))
+        if self.sample_frac is None:
+            self.dataset_size = self.sample_n
+        else:
+            self.dataset_size = len(data) * self.sample_frac
+        self.max_depth = np.round(np.log2(self.dataset_size))
         self.dtype_dict = {column: 'numerical' for column in numerical_columns(dataframe=data)}
         for column in categorical_columns(dataframe=data):
             self.dtype_dict[column] = 'categorical'
-        self.trees = [self._build_tree(data=data) for _ in range(self.number_trees)]
+        self.trees = []
+        for tree_index in range(self.number_trees):
+            self.trees.append(self._build_tree(data=data))
+            if tree_index % 10 == 9:
+                print("Built tree", tree_index + 1)
+        # self.trees = [self._build_tree(data=data) for _ in range(self.number_trees)]
 
-    def calculate_average_depth(self, data: pd.DataFrame) -> np.ndarray:
+    def calculate_anomaly_scores(self, data: pd.DataFrame) -> np.ndarray:
+        average_sample_path_lengths = self._calculate_average_depth(data=data)
+        return anomaly_score(average_sample_path_lengths=average_sample_path_lengths, sample_size=self.dataset_size)
+
+    def _calculate_average_depth(self, data: pd.DataFrame) -> np.ndarray:
         results = pd.DataFrame(np.zeros(shape=(len(data), len(self.trees))), columns=range(len(self.trees)), index=data.index)
         for tree_index, tree in enumerate(self.trees):
             results = self._calculate_depth_node(data=data, results=results, tree_index=tree_index, node=tree)
@@ -44,7 +58,10 @@ class IsolationForest:
             return results
 
     def _build_tree(self, data: pd.DataFrame) -> Node:
-        sampled_data = data.sample(frac=self.sample_frac, replace=self.replace)
+        if self.sample_frac is None:
+            sampled_data = data.sample(n=self.sample_n, replace=self.replace)
+        else:
+            sampled_data = data.sample(frac=self.sample_frac, replace=self.replace)
         root_node = Node(data=sampled_data, depth=0)
         queue = Queue()
         queue.put(root_node)
