@@ -1,9 +1,11 @@
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Callable, Union
 from queue import Queue
 
 import pandas as pd
 import numpy as np
+import tqdm
 
+from anomaly.isolation.column_selection import random_selector
 from anomaly.isolation.split_rule import NumericalSplitRule, CategoricalSplitRule
 from anomaly.isolation.node import Node
 from anomaly.isolation.metrics import anomaly_score
@@ -11,11 +13,21 @@ from anomaly.utils import categorical_columns, numerical_columns, map_string_to_
 
 
 class IsolationForest:
-    def __init__(self, number_trees: int, sample_frac: Optional[float] = None, sample_n: int = 256, replace: bool = True):
+    def __init__(self,
+                 number_trees: int,
+                 sample_frac: Optional[float] = None,
+                 sample_n: int = 256,
+                 replace: bool = True,
+                 anomaly_score_function: Callable[[Union[float, np.ndarray], float], Union[float, np.ndarray]] = anomaly_score,
+                 column_selector: Callable[[List[str], pd.DataFrame], str] = random_selector,
+                 power_ratio: float = 0.):
         self.number_trees = number_trees
         self.sample_frac = sample_frac
         self.sample_n = sample_n
         self.replace = replace
+        self.anomaly_score_function = anomaly_score_function
+        self.column_selector = column_selector
+        self.power_ratio = power_ratio
         self.trees: Optional[List[Node]] = None
         self.max_depth: Optional[int] = None
         self.dtype_dict: Optional[Dict[str, str]] = None
@@ -31,15 +43,12 @@ class IsolationForest:
         for column in categorical_columns(dataframe=data):
             self.dtype_dict[column] = 'categorical'
         self.trees = []
-        for tree_index in range(self.number_trees):
+        for _ in tqdm.trange(self.number_trees):
             self.trees.append(self._build_tree(data=data))
-            if tree_index % 10 == 9:
-                print("Built tree", tree_index + 1)
-        # self.trees = [self._build_tree(data=data) for _ in range(self.number_trees)]
 
     def calculate_anomaly_scores(self, data: pd.DataFrame) -> np.ndarray:
         average_sample_path_lengths = self._calculate_average_depth(data=data)
-        return anomaly_score(average_sample_path_lengths=average_sample_path_lengths, sample_size=self.dataset_size)
+        return self.anomaly_score_function(average_sample_path_lengths, self.dataset_size)
 
     def _calculate_average_depth(self, data: pd.DataFrame) -> np.ndarray:
         results = pd.DataFrame(np.zeros(shape=(len(data), len(self.trees))), columns=range(len(self.trees)), index=data.index)
@@ -74,7 +83,7 @@ class IsolationForest:
         diverse_columns = node.diverse_columns()
         if len(diverse_columns) == 0:
             return
-        selected_column = np.random.choice(diverse_columns)
+        selected_column = self.column_selector(diverse_columns, data)
         split_rule = self._create_split(data=data, selected_column=selected_column)
         left_node, right_node = node.create_split(split_rule=split_rule)
         if left_node.depth < self.max_depth:
@@ -83,10 +92,6 @@ class IsolationForest:
 
     def _create_split(self, data: pd.DataFrame, selected_column: str):
         if self.dtype_dict[selected_column] == 'numerical':
-            minimum = data[selected_column].min()
-            maximum = data[selected_column].max()
-            threshold = (maximum - minimum) * np.random.rand() + minimum
-            return NumericalSplitRule(column=selected_column, threshold=threshold)
+            return NumericalSplitRule.generate_split(data=data, column=selected_column)
         else:
-            left_categorical_values, _ = CategoricalSplitRule.sample_split(categorical_dtype=data[selected_column].dtype)
-            return CategoricalSplitRule(column=selected_column, categories_left=left_categorical_values)
+            return CategoricalSplitRule.generate_split(data=data, column=selected_column, power_ratio=self.power_ratio)
